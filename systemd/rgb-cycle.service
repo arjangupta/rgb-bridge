@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply the RGB color-cycle mode
+After=rgb-bridge.service
+Requires=rgb-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rgbctl cycle
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

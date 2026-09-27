@@ -1,0 +1,26 @@
+[Unit]
+Description=Restricted local RGB lighting broker
+Documentation=https://openrgb.org/
+After=systemd-udev-settle.service lm_sensors.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/rgb-bridge
+ExecStart=/usr/local/libexec/rgb-bridge-daemon
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=rgb-bridge
+RuntimeDirectoryMode=0750
+StateDirectory=rgb-bridge
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=false
+ProtectKernelTunables=false
+ProtectControlGroups=false
+ReadWritePaths=/var/lib/rgb-bridge /run/rgb-bridge
+
+[Install]
+WantedBy=multi-user.target

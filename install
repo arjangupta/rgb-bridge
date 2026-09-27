@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TARGET_USER=${RGB_BRIDGE_USER:-${SUDO_USER:-}}
+
+if [ "$(id -u)" -ne 0 ]; then
+    printf 'This installer must run as root (normally with sudo).\n' >&2
+    exit 1
+fi
+
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = root ]; then
+    printf 'Could not identify the desktop user. Set RGB_BRIDGE_USER explicitly.\n' >&2
+    exit 1
+fi
+
+TARGET_UID=$(id -u "$TARGET_USER")
+TARGET_GROUP=$(id -gn "$TARGET_USER")
+
+case "$TARGET_UID" in
+    *[!0-9]*|'') printf 'Invalid target UID.\n' >&2; exit 1 ;;
+esac
+
+case "$TARGET_GROUP" in
+    *[!A-Za-z0-9_.-]*|'') printf 'Target group contains unsupported characters.\n' >&2; exit 1 ;;
+esac
+
+if [ ! -x /opt/openrgb/AppRun ]; then
+    printf 'OpenRGB was not found at /opt/openrgb/AppRun.\n' >&2
+    exit 1
+fi
+
+systemctl disable --now openrgb.service 2>/dev/null || true
+
+install -d -o root -g root -m 0755 /usr/local/libexec /etc/default
+install -o root -g root -m 0755 "$REPO_DIR/src/rgb_bridge_daemon.py" /usr/local/libexec/rgb-bridge-daemon
+install -o root -g root -m 0755 "$REPO_DIR/bin/rgbctl" /usr/local/bin/rgbctl
+install -o root -g root -m 0644 "$REPO_DIR/systemd/rgb-bridge.service" /etc/systemd/system/rgb-bridge.service
+install -o root -g root -m 0644 "$REPO_DIR/systemd/rgb-cycle.service" /etc/systemd/system/rgb-cycle.service
+install -o root -g root -m 0755 "$REPO_DIR/systemd/rgb-cycle-resume" /usr/lib/systemd/system-sleep/rgb-cycle
+
+CONFIG_TMP=$(mktemp)
+trap 'rm -f "$CONFIG_TMP"' EXIT HUP INT TERM
+{
+    printf 'RGB_BRIDGE_ALLOWED_UID=%s\n' "$TARGET_UID"
+    printf 'RGB_BRIDGE_SOCKET_GROUP=%s\n' "$TARGET_GROUP"
+    printf 'RGB_BRIDGE_RAM_DEVICES=0,1\n'
+    printf 'RGB_BRIDGE_MOTHERBOARD_DEVICE=2\n'
+    printf 'RGB_BRIDGE_COOLER_LEDS=10\n'
+} >"$CONFIG_TMP"
+install -o root -g root -m 0644 "$CONFIG_TMP" /etc/default/rgb-bridge
+
+systemctl daemon-reload
+systemctl enable rgb-bridge.service
+systemctl restart rgb-bridge.service
+systemctl disable rgb-cycle.service 2>/dev/null || true
+systemctl reset-failed rgb-cycle.service
+if systemctl start rgb-cycle.service; then
+    systemctl enable rgb-cycle.service
+else
+    printf 'The broker installed, but the live cycle test failed; boot cycling remains disabled.\n' >&2
+    exit 1
+fi
+
+printf 'Restricted RGB broker installed for %s (UID %s); color cycling requested.\n' "$TARGET_USER" "$TARGET_UID"
