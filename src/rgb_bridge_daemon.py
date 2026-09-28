@@ -23,14 +23,31 @@ RAM_DEVICES = tuple(
 )
 MOTHERBOARD_DEVICE = int(os.environ.get("RGB_BRIDGE_MOTHERBOARD_DEVICE", "2"))
 COOLER_LEDS = int(os.environ.get("RGB_BRIDGE_COOLER_LEDS", "10"))
+COOLER_ZONE = int(os.environ.get("RGB_BRIDGE_COOLER_ZONE", "0"))
+MOTHERBOARD_ZONES = tuple(
+    int(value)
+    for value in os.environ.get("RGB_BRIDGE_MOTHERBOARD_ZONES", "2,3,4,5,6,7").split(",")
+)
+RAM_DIM_PERCENT = int(os.environ.get("RGB_BRIDGE_RAM_DIM_PERCENT", "18"))
 MAX_REQUEST = 4096
 COLOR_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+OPENRGB_ERROR_RE = re.compile(
+    r"^(?:Wrong number of colors specified|Please provide between|Invalid |Unknown )",
+    re.MULTILINE,
+)
+
+
+def dim_color(color: str, percent: int = RAM_DIM_PERCENT) -> str:
+    factor = max(0, min(100, percent)) / 100.0
+    channels = [int(color[index:index + 2], 16) for index in (0, 2, 4)]
+    return "".join(f"{round(channel * factor):02X}" for channel in channels)
 
 
 def openrgb_args(
     action: str,
     color: str | None = None,
     cooler_header: int | None = None,
+    workload: dict | None = None,
 ) -> list[str]:
     base = [OPENRGB, "--noautoconnect", "--config", CONFIG_DIR]
     motherboard = str(MOTHERBOARD_DEVICE)
@@ -64,6 +81,37 @@ def openrgb_args(
             "--mode", "Direct",
             "--color", color,
         ]
+
+    if action == "workload":
+        assert workload is not None
+        args = list(base)
+        ram = workload["ram"]
+        cpu = workload["cpu"]
+        gpu = workload["gpu"]
+        for device in RAM_DEVICES:
+            args += [
+                "--device", str(device),
+                "--mode", "Color Pulse",
+                "--speed", str(ram["speed"]),
+                "--color", f"{ram['color']},{dim_color(ram['color'])}",
+            ]
+        args += [
+            "--device", motherboard,
+            "--zone", str(COOLER_ZONE),
+            "--size", str(COOLER_LEDS),
+            "--mode", "Breathing",
+            "--speed", str(cpu["speed"]),
+            "--color", cpu["color"],
+        ]
+        for zone in MOTHERBOARD_ZONES:
+            args += [
+                "--device", motherboard,
+                "--zone", str(zone),
+                "--mode", "Breathing",
+                "--speed", str(gpu["speed"]),
+                "--color", gpu["color"],
+            ]
+        return args
     if action == "list":
         return base + ["--list-detailed"]
     raise ValueError("unsupported action")
@@ -72,17 +120,30 @@ def openrgb_args(
 def run_action(request: dict, uid: int) -> dict:
     action = request.get("action")
     if action == "status":
+        if set(request) != {"action"}:
+            return {"ok": False, "error": "status accepts no additional fields"}
         try:
             last = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             last = None
         return {"ok": True, "service": "ready", "last_action": last}
 
-    if action not in {"cycle", "static", "off", "cooler-test", "list"}:
+    if action not in {"cycle", "static", "off", "cooler-test", "workload", "list"}:
         return {
             "ok": False,
-            "error": "action must be cycle, static, off, cooler-test, list, or status",
+            "error": "action must be cycle, static, off, cooler-test, workload, list, or status",
         }
+
+    expected_fields = {
+        "cycle": {"action"},
+        "static": {"action", "color"},
+        "off": {"action"},
+        "cooler-test": {"action", "header", "color"},
+        "workload": {"action", "cpu", "gpu", "ram"},
+        "list": {"action"},
+    }[action]
+    if set(request) != expected_fields:
+        return {"ok": False, "error": f"{action} request fields are invalid"}
 
     color = request.get("color")
     if action in {"static", "cooler-test"}:
@@ -99,7 +160,25 @@ def run_action(request: dict, uid: int) -> dict:
     elif cooler_header is not None:
         return {"ok": False, "error": "header is only valid with cooler-test"}
 
-    command = openrgb_args(action, color, cooler_header)
+    workload = None
+    if action == "workload":
+        workload = {}
+        for channel in ("cpu", "gpu", "ram"):
+            value = request.get(channel)
+            if not isinstance(value, dict) or set(value) != {"color", "speed"}:
+                return {"ok": False, "error": f"{channel} must contain color and speed"}
+            channel_color = value.get("color")
+            channel_speed = value.get("speed")
+            if not isinstance(channel_color, str) or not COLOR_RE.fullmatch(channel_color):
+                return {"ok": False, "error": f"{channel} color must be six hexadecimal digits"}
+            if isinstance(channel_speed, bool) or not isinstance(channel_speed, int) or not 0 <= channel_speed <= 100:
+                return {"ok": False, "error": f"{channel} speed must be an integer from 0 to 100"}
+            workload[channel] = {
+                "color": channel_color.upper(),
+                "speed": channel_speed,
+            }
+
+    command = openrgb_args(action, color, cooler_header, workload)
     try:
         result = subprocess.run(
             command,
@@ -114,24 +193,31 @@ def run_action(request: dict, uid: int) -> dict:
     except subprocess.TimeoutExpired as exc:
         return {"ok": False, "error": "OpenRGB timed out", "output": exc.stdout or ""}
 
+    output_has_error = bool(OPENRGB_ERROR_RE.search(result.stdout))
     response = {
-        "ok": result.returncode == 0,
+        "ok": result.returncode == 0 and not output_has_error,
         "exit_code": result.returncode,
         "output": result.stdout[-16000:],
     }
-    if result.returncode != 0:
-        response["error"] = f"OpenRGB exited with code {result.returncode}"
+    if result.returncode != 0 or output_has_error:
+        response["error"] = (
+            f"OpenRGB exited with code {result.returncode}"
+            if result.returncode != 0
+            else "OpenRGB reported a command error"
+        )
         print(
             f"OpenRGB action={action} failed exit={result.returncode}: {result.stdout[-2000:]}",
             file=sys.stderr,
             flush=True,
         )
-    if result.returncode == 0 and action != "list":
+    if response["ok"] and action != "list":
         record = {"action": action, "requested_by_uid": uid}
         if color is not None:
             record["color"] = color
         if cooler_header is not None:
             record["header"] = cooler_header
+        if workload is not None:
+            record["channels"] = workload
         STATE_PATH.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
         os.chmod(STATE_PATH, 0o600)
     return response

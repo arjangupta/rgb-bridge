@@ -21,6 +21,10 @@ case "$TARGET_UID" in
     *[!0-9]*|'') printf 'Invalid target UID.\n' >&2; exit 1 ;;
 esac
 
+case "$TARGET_USER" in
+    *[!A-Za-z0-9_.-]*|'') printf 'Target user contains unsupported characters.\n' >&2; exit 1 ;;
+esac
+
 case "$TARGET_GROUP" in
     *[!A-Za-z0-9_.-]*|'') printf 'Target group contains unsupported characters.\n' >&2; exit 1 ;;
 esac
@@ -31,35 +35,51 @@ if [ ! -x /opt/openrgb/AppRun ]; then
 fi
 
 systemctl disable --now openrgb.service 2>/dev/null || true
+systemctl disable --now rgb-monitor.service 2>/dev/null || true
 
 install -d -o root -g root -m 0755 /usr/local/libexec /etc/default
 install -o root -g root -m 0755 "$REPO_DIR/src/rgb_bridge_daemon.py" /usr/local/libexec/rgb-bridge-daemon
+install -o root -g root -m 0755 "$REPO_DIR/src/rgb_workload_monitor.py" /usr/local/libexec/rgb-workload-monitor
 install -o root -g root -m 0755 "$REPO_DIR/bin/rgbctl" /usr/local/bin/rgbctl
 install -o root -g root -m 0644 "$REPO_DIR/systemd/rgb-bridge.service" /etc/systemd/system/rgb-bridge.service
 install -o root -g root -m 0644 "$REPO_DIR/systemd/rgb-cycle.service" /etc/systemd/system/rgb-cycle.service
 install -o root -g root -m 0755 "$REPO_DIR/systemd/rgb-cycle-resume" /usr/lib/systemd/system-sleep/rgb-cycle
 
+SERVICE_TMP=$(mktemp)
 CONFIG_TMP=$(mktemp)
-trap 'rm -f "$CONFIG_TMP"' EXIT HUP INT TERM
+trap 'rm -f "$CONFIG_TMP" "$SERVICE_TMP"' EXIT HUP INT TERM
+sed \
+    -e "s/@UID@/$TARGET_UID/g" \
+    -e "s/@GROUP@/$TARGET_GROUP/g" \
+    "$REPO_DIR/systemd/rgb-monitor.service.in" >"$SERVICE_TMP"
+install -o root -g root -m 0644 "$SERVICE_TMP" /etc/systemd/system/rgb-monitor.service
+
 {
     printf 'RGB_BRIDGE_ALLOWED_UID=%s\n' "$TARGET_UID"
     printf 'RGB_BRIDGE_SOCKET_GROUP=%s\n' "$TARGET_GROUP"
     printf 'RGB_BRIDGE_RAM_DEVICES=0,1\n'
     printf 'RGB_BRIDGE_MOTHERBOARD_DEVICE=2\n'
     printf 'RGB_BRIDGE_COOLER_LEDS=10\n'
+    printf 'RGB_BRIDGE_COOLER_ZONE=0\n'
+    printf 'RGB_BRIDGE_MOTHERBOARD_ZONES=2,3,4,5,6,7\n'
+    printf 'RGB_BRIDGE_MONITOR_INTERVAL=15\n'
+    printf 'RGB_BRIDGE_RAM_MIN_SPEED=55\n'
+    printf 'RGB_BRIDGE_RAM_DIM_PERCENT=18\n'
 } >"$CONFIG_TMP"
 install -o root -g root -m 0644 "$CONFIG_TMP" /etc/default/rgb-bridge
 
 systemctl daemon-reload
 systemctl enable rgb-bridge.service
 systemctl restart rgb-bridge.service
-systemctl disable rgb-cycle.service 2>/dev/null || true
-systemctl reset-failed rgb-cycle.service
+systemctl disable --now rgb-cycle.service 2>/dev/null || true
+systemctl reset-failed rgb-cycle.service 2>/dev/null || true
 if systemctl start rgb-cycle.service; then
-    systemctl enable rgb-cycle.service
+    systemctl stop rgb-cycle.service
 else
-    printf 'The broker installed, but the live cycle test failed; boot cycling remains disabled.\n' >&2
+    printf 'The broker installed, but the live RGB test failed; workload monitoring remains disabled.\n' >&2
     exit 1
 fi
 
-printf 'Restricted RGB broker installed for %s (UID %s); color cycling requested.\n' "$TARGET_USER" "$TARGET_UID"
+systemctl enable --now rgb-monitor.service
+
+printf 'Restricted RGB broker and workload monitor installed for %s (UID %s).\n' "$TARGET_USER" "$TARGET_UID"

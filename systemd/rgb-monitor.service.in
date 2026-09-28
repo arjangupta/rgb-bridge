@@ -1,0 +1,27 @@
+[Unit]
+Description=Workload-responsive RGB lighting monitor
+After=rgb-bridge.service
+Requires=rgb-bridge.service
+
+[Service]
+Type=simple
+User=@UID@
+Group=@GROUP@
+EnvironmentFile=/etc/default/rgb-bridge
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+ExecStart=/usr/local/libexec/rgb-workload-monitor
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=false
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
